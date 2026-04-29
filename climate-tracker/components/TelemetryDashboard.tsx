@@ -22,17 +22,18 @@ import {
   Thermometer,
   Wind,
 } from "lucide-react";
-import { supabaseClient } from "../lib/supabase/client";
+import { database } from "../lib/firebase/client";
+import { onValue, ref } from "firebase/database";
 import type { jsPDF as JsPDFType } from "jspdf";
 
 type TelemetryPoint = {
   time: string;
-  co2: number;
-  co: number;
-  pm25: number;
-  temperature: number;
+  alert: boolean;
+  altitude: number;
   humidity: number;
-  aqi: number;
+  light: number;
+  pressure: number;
+  temp: number;
 };
 
 type SensorStatus = "normal" | "warning" | "alert";
@@ -72,35 +73,35 @@ const STATIC_SERIES: TelemetryPoint[] = Array.from(
     const hour = String(index).padStart(2, "0");
     return {
       time: `${hour}:00`,
-      co2: 480 + index * 12,
-      co: 8 + (index % 6),
-      pm25: Number((0.014 + index * 0.001).toFixed(3)),
-      temperature: Number((21.2 + index * 0.25).toFixed(1)),
-      humidity: 48 + (index % 10),
-      aqi: 55 + index * 2,
+      alert: false,
+      altitude: Number((119.08 + index * 0.1).toFixed(2)),
+      humidity: 78 + (index % 5),
+      light: 1700 + (index * 10),
+      pressure: Number((990.0 + index * 0.5).toFixed(2)),
+      temp: Number((30.0 + index * 0.25).toFixed(2)),
     };
   }
 );
 
 const nextValues = (seed: Omit<TelemetryPoint, "time">) => ({
-  co2: Math.round(clamp(jitter(seed.co2, 60), 10, 1400)),
-  co: Math.round(clamp(jitter(seed.co, 18), 0, 200)),
-  pm25: Number(clamp(jitter(seed.pm25, 0.015), 0.001, 0.35).toFixed(3)),
-  temperature: Number(clamp(jitter(seed.temperature, 1.2), 0, 50).toFixed(1)),
+  alert: seed.alert,
+  altitude: Number(clamp(jitter(seed.altitude, 0.5), 115, 125).toFixed(2)),
   humidity: Math.round(clamp(jitter(seed.humidity, 3), 20, 90)),
-  aqi: Math.round(clamp(jitter(seed.aqi, 8), 10, 180)),
+  light: Math.round(clamp(jitter(seed.light, 100), 500, 3000)),
+  pressure: Number(clamp(jitter(seed.pressure, 5), 950, 1050).toFixed(2)),
+  temp: Number(clamp(jitter(seed.temp, 1.2), 0, 50).toFixed(2)),
 });
 
 const generateMockSeries = (): TelemetryPoint[] => {
   const now = new Date();
   const points: TelemetryPoint[] = [];
   let seed = {
-    co2: 540,
-    co: 14,
-    pm25: 0.018,
-    temperature: 23.4,
-    humidity: 54,
-    aqi: 62,
+    alert: false,
+    altitude: 119.08,
+    humidity: 79,
+    light: 1805,
+    pressure: 999.02,
+    temp: 33.33,
   };
 
   for (let i = 0; i < 24; i += 1) {
@@ -117,61 +118,17 @@ const generateMockSeries = (): TelemetryPoint[] => {
 
 const buildNextPoint = (previous: TelemetryPoint) => {
   const seed = {
-    co2: previous.co2,
-    co: previous.co,
-    pm25: previous.pm25,
-    temperature: previous.temperature,
+    alert: previous.alert,
+    altitude: previous.altitude,
     humidity: previous.humidity,
-    aqi: previous.aqi,
+    light: previous.light,
+    pressure: previous.pressure,
+    temp: previous.temp,
   };
 
   return {
     time: formatTime(new Date()),
     ...nextValues(seed),
-  };
-};
-
-const getNumber = (data: Record<string, unknown>, keys: string[]) => {
-  for (const key of keys) {
-    const value = data[key];
-    if (value === null || value === undefined) continue;
-    const numeric = Number(value);
-    if (Number.isFinite(numeric)) return numeric;
-  }
-  return null;
-};
-
-const mapRealtimePayload = (payload: { new?: Record<string, unknown> }) => {
-  const raw = payload?.new ?? {};
-  const timeValue = raw.created_at ?? new Date().toISOString();
-  const timestamp = new Date(String(timeValue));
-
-  const co2 = getNumber(raw, ["co2", "co2_ppm", "co2ppm"]);
-  const co = getNumber(raw, ["co", "co_ppm", "coppm"]);
-  const pm25 = getNumber(raw, ["pm25", "pm25_mg_m3", "pm25_mgm3"]);
-  const temperature = getNumber(raw, ["temperature", "temperature_c", "temp_c"]);
-  const humidity = getNumber(raw, ["humidity", "humidity_rh", "humidity_percent"]);
-  const aqi = getNumber(raw, ["aqi", "air_quality_index"]);
-
-  if (
-    co2 === null &&
-    co === null &&
-    pm25 === null &&
-    temperature === null &&
-    humidity === null &&
-    aqi === null
-  ) {
-    return null;
-  }
-
-  return {
-    time: formatTime(timestamp),
-    co2,
-    co,
-    pm25,
-    temperature,
-    humidity,
-    aqi,
   };
 };
 
@@ -185,12 +142,11 @@ const statusStyles: Record<SensorStatus, string> = {
 };
 
 const telemetryLines = [
-  { key: "co2", label: "CO2", color: "#2D9C84" },
-  { key: "co", label: "CO", color: "#FACC15" },
-  { key: "pm25", label: "PM2.5", color: "#8B8B91" },
-  { key: "temperature", label: "Temp", color: "#3AB89E" },
+  { key: "temp", label: "Temp", color: "#3AB89E" },
   { key: "humidity", label: "Humidity", color: "#62D1BE" },
-  { key: "aqi", label: "AQI", color: "#D1B146" },
+  { key: "light", label: "Light", color: "#D1B146" },
+  { key: "pressure", label: "Pressure", color: "#8B8B91" },
+  { key: "altitude", label: "Altitude", color: "#2D9C84" },
 ];
 
 const chartLabelStyle = {
@@ -207,12 +163,11 @@ const SENSOR_META: {
   decimals: number;
   thresholds: { alert?: number; warning?: number };
 }[] = [
-  { key: "co2",         label: "CO2 Concentration", unit: "PPM",   decimals: 0, thresholds: { alert: 1000 } },
-  { key: "co",          label: "Carbon Monoxide",   unit: "PPM",   decimals: 0, thresholds: { alert: 100, warning: 10 } },
-  { key: "pm25",        label: "PM2.5 Dust",        unit: "MG/M³", decimals: 3, thresholds: {} },
-  { key: "temperature", label: "Temperature",       unit: "°C",    decimals: 1, thresholds: {} },
-  { key: "humidity",    label: "Humidity",          unit: "%RH",   decimals: 0, thresholds: {} },
-  { key: "aqi",         label: "Air Quality Index", unit: "AQI",   decimals: 0, thresholds: {} },
+  { key: "temp",        label: "Temperature",       unit: "°C",    decimals: 1, thresholds: { alert: 40, warning: 35 } },
+  { key: "humidity",    label: "Humidity",          unit: "%RH",   decimals: 0, thresholds: { alert: 90, warning: 80 } },
+  { key: "light",       label: "Light",             unit: "LUX",   decimals: 0, thresholds: {} },
+  { key: "pressure",    label: "Pressure",          unit: "hPa",   decimals: 2, thresholds: {} },
+  { key: "altitude",    label: "Altitude",          unit: "m",     decimals: 2, thresholds: {} },
 ];
 
 function getSensorStatus(key: keyof TelemetryPoint, value: number): SensorStatus {
@@ -274,7 +229,7 @@ async function exportTelemetryToPDF(
   doc.setFont("helvetica", "normal");
   doc.text(`Generated: ${reportDate}  ${reportTime}`, MARGIN + 2, 29);
   doc.text(
-    `Data Source: ${connected ? "Supabase Realtime" : "Simulated (Mock)"}  |  Zone 1  |  Last Sync: ${lastSyncLabel}`,
+    `Data Source: ${connected ? "Firebase Realtime" : "Simulated (Mock)"}  |  Zone 1  |  Last Sync: ${lastSyncLabel}`,
     MARGIN + 2,
     33.5,
   );
@@ -367,8 +322,8 @@ async function exportTelemetryToPDF(
   y += 3;
 
   // History table header
-  const HIST_COLS = [18, 26, 22, 22, 28, 26, 22];
-  const HIST_HEADERS = ["TIME", "CO2 (PPM)", "CO (PPM)", "PM2.5", "TEMP (°C)", "HUM (%RH)", "AQI"];
+  const HIST_COLS = [18, 22, 22, 22, 26, 26];
+  const HIST_HEADERS = ["TIME", "TEMP (°C)", "HUM (%RH)", "LIGHT", "ALT (m)", "PRES (hPa)"];
   let hcx = MARGIN;
 
   setFill("#151515");
@@ -400,23 +355,16 @@ async function exportTelemetryToPDF(
 
     const cells = [
       point.time,
-      String(point.co2),
-      String(point.co),
-      point.pm25.toFixed(3),
-      point.temperature.toFixed(1),
+      point.temp.toFixed(1),
       String(point.humidity),
-      String(point.aqi),
+      String(point.light),
+      point.altitude.toFixed(2),
+      point.pressure.toFixed(2),
     ];
 
     cells.forEach((cell, i) => {
       if (i === 0) {
         setTextColor("#62626B");
-      } else if (i === 1) {
-        const co2Status = getSensorStatus("co2", point.co2);
-        setTextColor(co2Status === "alert" ? "#FACC15" : "#FFFFFF");
-      } else if (i === 2) {
-        const coStatus = getSensorStatus("co", point.co);
-        setTextColor(coStatus === "alert" ? "#FACC15" : coStatus === "warning" ? "#D4A810" : "#FFFFFF");
       } else {
         setTextColor("#FFFFFF");
       }
@@ -455,53 +403,75 @@ export default function TelemetryDashboard() {
   seriesRef.current = series;
   const lastSyncRef = useRef(lastSyncLabel);
   lastSyncRef.current = lastSyncLabel;
-  const connected = Boolean(supabaseClient);
+  const connected = Boolean(database);
+
+  const [aiFeedback, setAiFeedback] = useState<string>("");
+
+  useEffect(() => {
+    if (!series || series.length === 0) return;
+    const latestCount = series[series.length - 1];
+    if (!latestCount) return;
+    
+    // Quick 1-liner 
+    const prompt = `Provide a single line 5-10 word short summary feedback based on this data: Temp: ${latestCount.temp}C, Hum: ${latestCount.humidity}%, Light: ${latestCount.light}, Pressure: ${latestCount.pressure}. Start with 'AI Status: '`;
+    
+    fetch("/api/ai-analysis", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: prompt }] }),
+    }).then(async r => {
+       const text = await r.text();
+       const lines = text.split("\\n").filter(l => l.startsWith("data: "));
+       let fullAns = "";
+       for(const l of lines){
+         if(l.includes("[DONE]")) break;
+         try {
+           const parsed = JSON.parse(l.replace("data: ","").trim());
+           if(parsed.choices?.[0]?.delta?.content) fullAns += parsed.choices[0].delta.content;
+         } catch(e) {}
+       }
+       if(fullAns) setAiFeedback(fullAns);
+    });
+  }, [series.length]);
 
   useEffect(() => {
     setLastSyncLabel(formatSyncTime(new Date()));
-    if (!supabaseClient) {
+    if (!database) {
       setSeries(generateMockSeries());
     }
   }, []);
 
   useEffect(() => {
-    if (!supabaseClient) return;
+    if (!database) return;
 
-    const channel = supabaseClient
-      .channel("telemetry-stream")
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "telemetry" },
-        (payload) => {
-          const incoming = mapRealtimePayload(payload as { new?: Record<string, unknown> });
-          if (!incoming) return;
-
-          setSeries((prev) => {
-            const latest = prev[prev.length - 1];
-            const nextPoint = {
-              time: incoming.time,
-              co2: incoming.co2 ?? latest?.co2 ?? 0,
-              co: incoming.co ?? latest?.co ?? 0,
-              pm25: incoming.pm25 ?? latest?.pm25 ?? 0,
-              temperature: incoming.temperature ?? latest?.temperature ?? 0,
-              humidity: incoming.humidity ?? latest?.humidity ?? 0,
-              aqi: incoming.aqi ?? latest?.aqi ?? 0,
-            };
-
-            return [...prev.slice(-23), nextPoint];
-          });
-          setLastSyncLabel(formatSyncTime(new Date()));
-        }
-      )
-      .subscribe();
+    const sensorRef = ref(database, "sensor");
+    const unsubscribe = onValue(sensorRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.val();
+        setSeries((prev) => {
+          const latest = prev[prev.length - 1];
+          const nextPoint: TelemetryPoint = {
+            time: formatTime(new Date()),
+            alert: data.alert ?? latest?.alert ?? false,
+            altitude: data.altitude ?? latest?.altitude ?? 0,
+            humidity: data.humidity ?? latest?.humidity ?? 0,
+            light: data.light ?? latest?.light ?? 0,
+            pressure: data.pressure ?? latest?.pressure ?? 0,
+            temp: data.temp ?? latest?.temp ?? 0,
+          };
+          return [...prev.slice(-23), nextPoint];
+        });
+        setLastSyncLabel(formatSyncTime(new Date()));
+      }
+    });
 
     return () => {
-      channel.unsubscribe();
+      unsubscribe();
     };
   }, []);
 
   useEffect(() => {
-    if (supabaseClient) return;
+    if (database) return;
 
     const id = setInterval(() => {
       setSeries((prev) => {
@@ -519,46 +489,15 @@ export default function TelemetryDashboard() {
   const previous = series[series.length - 2] ?? latest;
   const sparklineData = series.slice(-12);
 
-  const co2Status: SensorStatus = latest.co2 > 1000 ? "alert" : "normal";
-  const coStatus: SensorStatus =
-    latest.co > 100 ? "alert" : latest.co > 10 ? "warning" : "normal";
-
   const sensors = useMemo(
     () => [
       {
-        key: "co2",
-        label: "CO2 Concentration",
-        unit: "PPM",
-        value: latest.co2,
-        previous: previous.co2,
-        status: co2Status,
-        icon: Wind,
-      },
-      {
-        key: "co",
-        label: "Carbon Monoxide",
-        unit: "PPM",
-        value: latest.co,
-        previous: previous.co,
-        status: coStatus,
-        icon: Flame,
-      },
-      {
-        key: "pm25",
-        label: "PM2.5 Dust",
-        unit: "MG/M3",
-        value: latest.pm25,
-        previous: previous.pm25,
-        status: "normal" as SensorStatus,
-        icon: Filter,
-      },
-      {
-        key: "temperature",
+        key: "temp",
         label: "Temperature",
-        unit: "C",
-        value: latest.temperature,
-        previous: previous.temperature,
-        status: "normal" as SensorStatus,
+        unit: "°C",
+        value: latest.temp,
+        previous: previous.temp,
+        status: (latest.temp > 40 ? "alert" : latest.temp > 35 ? "warning" : "normal") as SensorStatus,
         icon: Thermometer,
       },
       {
@@ -567,34 +506,48 @@ export default function TelemetryDashboard() {
         unit: "%RH",
         value: latest.humidity,
         previous: previous.humidity,
-        status: "normal" as SensorStatus,
+        status: (latest.humidity > 90 ? "alert" : latest.humidity > 80 ? "warning" : "normal") as SensorStatus,
         icon: Droplets,
       },
       {
-        key: "aqi",
-        label: "Air Quality Index",
-        unit: "AQI",
-        value: latest.aqi,
-        previous: previous.aqi,
+        key: "light",
+        label: "Light Level",
+        unit: "LUX",
+        value: latest.light,
+        previous: previous.light,
+        status: "normal" as SensorStatus,
+        icon: Flame,
+      },
+      {
+        key: "altitude",
+        label: "Altitude",
+        unit: "m",
+        value: latest.altitude,
+        previous: previous.altitude,
+        status: "normal" as SensorStatus,
+        icon: Filter,
+      },
+      {
+        key: "pressure",
+        label: "Pressure",
+        unit: "hPa",
+        value: latest.pressure,
+        previous: previous.pressure,
         status: "normal" as SensorStatus,
         icon: Gauge,
-      },
+      }
     ],
     [
-      latest.aqi,
-      latest.co,
-      latest.co2,
+      latest.temp,
       latest.humidity,
-      latest.pm25,
-      latest.temperature,
-      previous.aqi,
-      previous.co,
-      previous.co2,
+      latest.light,
+      latest.altitude,
+      latest.pressure,
+      previous.temp,
       previous.humidity,
-      previous.pm25,
-      previous.temperature,
-      co2Status,
-      coStatus,
+      previous.light,
+      previous.altitude,
+      previous.pressure,
     ]
   );
 
@@ -656,6 +609,11 @@ export default function TelemetryDashboard() {
               <span className="rounded-full border border-[#2D9C84]/50 bg-[#0E0E0E] px-3 py-1 text-[#2D9C84]">
                 Zone 1
               </span>
+              {aiFeedback && (
+                <span className="rounded-full border border-[#FACC15]/50 bg-[#14110A] px-3 py-1 text-[#FACC15] max-w-xl truncate" title={aiFeedback}>
+                  ✨ {aiFeedback}
+                </span>
+              )}
             </div>
             {activeView === "dashboard" && (
               <button
@@ -806,7 +764,7 @@ export default function TelemetryDashboard() {
 
 function buildSystemPrompt(series: TelemetryPoint[], latest: TelemetryPoint, connected: boolean): string {
   const previous = series[series.length - 2] ?? latest;
-  const dataSource = connected ? "Supabase Realtime" : "Simulated (Mock)";
+  const dataSource = connected ? "Firebase Realtime" : "Simulated (Mock)";
 
   const formatRow = (key: keyof TelemetryPoint, label: string, unit: string, decimals: number) => {
     const currentVal = latest[key] as number;
@@ -823,7 +781,7 @@ function buildSystemPrompt(series: TelemetryPoint[], latest: TelemetryPoint, con
 
   const historyRows = series
     .slice(-6)
-    .map((p) => `  [${p.time}] CO2:${p.co2} CO:${p.co} PM2.5:${p.pm25.toFixed(3)} Temp:${p.temperature.toFixed(1)}°C Hum:${p.humidity}% AQI:${p.aqi}`)
+    .map((p) => `  [${p.time}] Temp:${p.temp.toFixed(1)}°C Hum:${p.humidity}% Light:${p.light} Alt:${p.altitude.toFixed(2)}m Press:${p.pressure.toFixed(2)}hPa Alert:${p.alert}`)
     .join("\n");
 
   return `You are an expert environmental monitoring AI analyst embedded in the ENV-MONITOR climate dashboard.
@@ -835,18 +793,16 @@ TOTAL DATA POINTS: ${series.length} readings (24-hour window)
 CURRENT TIME: ${new Date().toLocaleString()}
 
 === CURRENT SENSOR READINGS ===
-${formatRow("co2", "CO2 Concentration", "PPM", 0)}
-${formatRow("co", "Carbon Monoxide", "PPM", 0)}
-${formatRow("pm25", "PM2.5 Dust", "MG/M³", 3)}
-${formatRow("temperature", "Temperature", "°C", 1)}
+${formatRow("temp", "Temperature", "°C", 1)}
 ${formatRow("humidity", "Humidity", "%RH", 0)}
-${formatRow("aqi", "Air Quality Index", "AQI", 0)}
+${formatRow("light", "Light Level", "LUX", 0)}
+${formatRow("altitude", "Altitude", "m", 2)}
+${formatRow("pressure", "Pressure", "hPa", 2)}
 
 === ALERT STATUS ===
-- CO2: ${latest.co2 > 1000 ? "⚠️ ALERT (>1000 PPM)" : "✅ Normal"}
-- CO: ${latest.co > 100 ? "🚨 ALERT (>100 PPM)" : latest.co > 10 ? "⚠️ WARNING (>10 PPM)" : "✅ Normal"}
-- PM2.5: ${latest.pm25 > 0.1 ? "⚠️ Elevated" : "✅ Normal"}
-- AQI: ${latest.aqi > 100 ? "⚠️ Unhealthy" : latest.aqi > 50 ? "⚠️ Moderate" : "✅ Good"}
+- Temp: ${latest.temp > 40 ? "🚨 ALERT (>40 °C)" : latest.temp > 35 ? "⚠️ WARNING (>35 °C)" : "✅ Normal"}
+- Humidity: ${latest.humidity > 90 ? "🚨 ALERT (>90 %)" : latest.humidity > 80 ? "⚠️ WARNING (>80 %)" : "✅ Normal"}
+- Alert Flag: ${latest.alert ? "🚨 ACTIVE" : "✅ Normal"}
 
 === LAST 6 READINGS (RECENT HISTORY) ===
 ${historyRows}
@@ -1182,9 +1138,9 @@ function SensorCard({
 
       <div className="flex items-baseline gap-3">
         <span className="text-3xl font-semibold tracking-[-0.02em]">
-          {sparklineKey === "pm25"
-            ? formatMetric(value, 3)
-            : sparklineKey === "temperature"
+          {sparklineKey === "pressure" || sparklineKey === "altitude"
+            ? formatMetric(value, 2)
+            : sparklineKey === "temp"
               ? formatMetric(value, 1)
               : formatMetric(value)}
         </span>
